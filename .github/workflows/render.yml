@@ -4,27 +4,67 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: still = one frame (fast test), render = video
+        description: still = one frame (fast test), render = full video in parallel chunks
         type: choice
         options: [still, render]
         default: still
       frame:
         description: Frame number for still mode
         default: "100"
-      frames:
-        description: Render range like 0-299 (empty = all frames)
-        default: ""
+      chunks:
+        description: Parallel jobs for render mode (max 20 on the free plan)
+        default: "8"
       scale:
         description: 0.5 test, 1 = 1080x1920, 1.3333 = 2K final
         default: "0.5"
       concurrency:
-        description: Parallel browser tabs
+        description: Browser tabs per job
         default: "2"
 
 jobs:
-  render:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        env:
+          MODE: ${{ inputs.mode }}
+          FRAME: ${{ inputs.frame }}
+          CHUNKS: ${{ inputs.chunks }}
+        run: |
+          TOTAL=$(grep -oP 'TOTAL = \K[0-9]+' templates/bridge/story.ts | head -1)
+          export TOTAL
+          MATRIX=$(python3 - <<'PY'
+          import json, math, os
+          total = int(os.environ["TOTAL"])
+          if os.environ["MODE"] == "still":
+              f = int(os.environ["FRAME"])
+              m = [{"idx": "00", "a": f, "b": f}]
+          else:
+              n = max(1, min(20, int(os.environ["CHUNKS"])))
+              size = math.ceil(total / n)
+              m = []
+              for i in range(n):
+                  a = i * size
+                  if a > total - 1:
+                      break
+                  m.append({"idx": f"{i:02d}", "a": a, "b": min(total - 1, a + size - 1)})
+          print(json.dumps({"include": m}, separators=(",", ":")))
+          PY
+          )
+          echo "total frames: $TOTAL"
+          echo "$MATRIX"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +86,6 @@ jobs:
           cp -r ci/src/. proj/src/
           cp -r templates/bridge proj/src/videos/bridge
           if [ -d ci/public ]; then cp -r ci/public/. proj/public/; fi
-          ls proj/public/bridge/kenney | wc -l
 
       - name: Install
         working-directory: proj
@@ -58,35 +97,61 @@ jobs:
         working-directory: proj
         env:
           MODE: ${{ inputs.mode }}
-          FRAME: ${{ inputs.frame }}
-          FRAMES: ${{ inputs.frames }}
+          IDX: ${{ matrix.idx }}
+          A: ${{ matrix.a }}
+          B: ${{ matrix.b }}
           SCALE: ${{ inputs.scale }}
           CONC: ${{ inputs.concurrency }}
         run: |
           set -e
           mkdir -p ../out
           if [ "$MODE" = "still" ]; then
-            npx remotion still src/index.ts BridgeShort "../out/still_$FRAME.png" \
-              --frame="$FRAME" --scale="$SCALE" --gl=swangle --timeout=300000
+            npx remotion still src/index.ts BridgeShort "../out/still_$A.png" \
+              --frame="$A" --scale="$SCALE" --gl=swangle --timeout=300000
           else
-            ARGS=""
-            if [ -n "$FRAMES" ]; then ARGS="--frames=$FRAMES"; fi
-            npx remotion render src/index.ts BridgeShort ../out/video.mp4 \
+            npx remotion render src/index.ts BridgeShort "../out/part_$IDX.mp4" \
               --codec=h264 --crf=16 --scale="$SCALE" --gl=swangle \
-              --concurrency="$CONC" --timeout=300000 $ARGS
-          fi
-
-      - name: Mux audio (only if ci/audio/mix.wav exists)
-        if: ${{ inputs.mode == 'render' }}
-        run: |
-          if [ -f ci/audio/mix.wav ]; then
-            ffmpeg -y -i out/video.mp4 -i ci/audio/mix.wav -map 0:v:0 -map 1:a:0 \
-              -c:v copy -c:a aac -b:a 192k -shortest out/final.mp4
+              --concurrency="$CONC" --timeout=300000 --muted --frames="$A-$B"
           fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: short-${{ inputs.mode }}
+          name: part-${{ matrix.idx }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+
+  assemble:
+    needs: render
+    if: ${{ inputs.mode == 'render' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          merge-multiple: true
+          path: parts
+
+      - name: Concat (and mux audio if ci/audio/mix.wav exists)
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          mkdir -p out
+          cd parts
+          for f in $(ls part_*.mp4 | sort); do echo "file '$f'" >> list.txt; done
+          cat list.txt
+          ffmpeg -y -f concat -safe 0 -i list.txt -c copy ../out/video.mp4
+          cd ..
+          if [ -f ci/audio/mix.wav ]; then
+            ffmpeg -y -i out/video.mp4 -i ci/audio/mix.wav -map 0:v:0 -map 1:a:0 \
+              -c:v copy -c:a aac -b:a 192k -shortest out/final.mp4
+          fi
+          ffprobe -v error -show_entries format=duration:stream=nb_frames -of default=nw=1 out/video.mp4
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: short
           path: out/
           if-no-files-found: error
           retention-days: 7
