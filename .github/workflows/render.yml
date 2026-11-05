@@ -1,0 +1,92 @@
+name: Render short
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: still = one frame (fast test), render = video
+        type: choice
+        options: [still, render]
+        default: still
+      frame:
+        description: Frame number for still mode
+        default: "100"
+      frames:
+        description: Render range like 0-299 (empty = all frames)
+        default: ""
+      scale:
+        description: 0.5 test, 1 = 1080x1920, 1.3333 = 2K final
+        default: "0.5"
+      concurrency:
+        description: Parallel browser tabs
+        default: "2"
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev \
+            libasound2t64 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
+            libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
+
+      - name: Assemble Remotion project
+        run: |
+          mkdir -p proj/src/videos proj/public/bridge/kenney
+          cp ci/package.json proj/
+          cp -r ci/src/. proj/src/
+          cp -r templates/bridge proj/src/videos/bridge
+          if [ -d ci/public ]; then cp -r ci/public/. proj/public/; fi
+          ls proj/public/bridge/kenney | wc -l
+
+      - name: Install
+        working-directory: proj
+        run: |
+          npm install --legacy-peer-deps
+          npx remotion browser ensure
+
+      - name: Render
+        working-directory: proj
+        env:
+          MODE: ${{ inputs.mode }}
+          FRAME: ${{ inputs.frame }}
+          FRAMES: ${{ inputs.frames }}
+          SCALE: ${{ inputs.scale }}
+          CONC: ${{ inputs.concurrency }}
+        run: |
+          set -e
+          mkdir -p ../out
+          if [ "$MODE" = "still" ]; then
+            npx remotion still src/index.ts BridgeShort "../out/still_$FRAME.png" \
+              --frame="$FRAME" --scale="$SCALE" --gl=swangle --timeout=300000
+          else
+            ARGS=""
+            if [ -n "$FRAMES" ]; then ARGS="--frames=$FRAMES"; fi
+            npx remotion render src/index.ts BridgeShort ../out/video.mp4 \
+              --codec=h264 --crf=16 --scale="$SCALE" --gl=swangle \
+              --concurrency="$CONC" --timeout=300000 $ARGS
+          fi
+
+      - name: Mux audio (only if ci/audio/mix.wav exists)
+        if: ${{ inputs.mode == 'render' }}
+        run: |
+          if [ -f ci/audio/mix.wav ]; then
+            ffmpeg -y -i out/video.mp4 -i ci/audio/mix.wav -map 0:v:0 -map 1:a:0 \
+              -c:v copy -c:a aac -b:a 192k -shortest out/final.mp4
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: short-${{ inputs.mode }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
